@@ -5,6 +5,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from keep_alive import keep_alive
+import time
 
 keep_alive()
 load_dotenv()
@@ -238,5 +239,7 @@ async def createRide(interaction: discord.Interaction, content: str):
 async def purge(interaction: discord.Interaction, limit: int = 100):
     deleted = await interaction.channel.purge(limit=limit)
     await interaction.followup.send(f"✅ 清理完成！已刪除 {len(deleted)} 則訊息。", ephemeral=True)
-
-client.run(TOKEN)
+if __name__ == "__main__":
+    keep_alive()
+    time.sleep(5)  # 稍微延遲，避開頻繁連線
+    client.run(TOKEN)
