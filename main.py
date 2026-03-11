@@ -4,7 +4,9 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from keep_alive import keep_alive
 
+keep_alive()
 load_dotenv()
 
 url: str = os.getenv("SUPABASE_URL")
