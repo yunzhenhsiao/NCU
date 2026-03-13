@@ -137,6 +137,7 @@ class Client(commands.Bot):
             for r in active_rides.data:
                 # 重新註冊 View
                 # 這裡的 RideActionView 必須傳入對應的 ride_id 和 host_id
+                self.add_view(ThreadActionView(ride_id=r['id']))
                 self.add_view(RideActionView(ride_id=r['id'], host_id=int(r['host_id'])))
                 count += 1
             print(f"成功恢復 {count} 個拼車按鈕。")
@@ -263,98 +264,127 @@ class RideActionView(discord.ui.View):
         self.ride_id = ride_id
         self.host_id = host_id
         
-        # 使用固定的 custom_id，機器人重啟後才能透過這個 ID 認出它
         self.add_item(discord.ui.Button(
             label="加入拼車", 
             style=discord.ButtonStyle.success, 
             custom_id=f"join:{ride_id}"
         ))
-        self.add_item(discord.ui.Button(
-            label="退出拼車", 
-            style=discord.ButtonStyle.danger, 
-            custom_id=f"leave:{ride_id}"
-        ))
 
-    # 針對動態 custom_id 的處理方式
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         cid = interaction.data.get('custom_id', '')
         if cid.startswith("join:"):
+            # 1. 檢查是否為主揪
             if interaction.user.id == self.host_id:
-                return await interaction.response.send_message("❌ 你是主揪，不能重複加入自己的車！", ephemeral=True)
+                await interaction.response.send_message("❌ 你是主揪，不用加入自己的車喔！", ephemeral=True)
+                return False
             
-            await interaction.response.defer(ephemeral=True)
-            # 使用 self.ride_id 進行 RPC 呼叫
-            res = supabase.rpc('join_ride', {'ride_uuid': self.ride_id, 'member_id': str(interaction.user.id)}).execute()
-            if res.data['success']:
-                # 取得最新資料來更新 UI
-                ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
-                
-                # 通知討論串
-                thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
-                await thread.add_user(interaction.user)
-                await thread.send(f"✅ **{interaction.user.display_name}** 已加入拼車！目前人數：{ride['current_passengers']}/{ride['max_passengers']}")
-
-                # 更新原訊息 Embed
-                embed = interaction.message.embeds[0]
-                embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
-                
-                # 檢查是否滿人需要關閉按鈕
-                if ride['current_passengers'] >= ride['max_passengers']:
-                    await interaction.message.edit(content="🔒 **本車已滿員**", embed=embed, view=None)
-                    supabase.table("rides").update({"status": "inactive"}).eq("id", self.ride_id).execute()
-                else:
-                    await interaction.message.edit(embed=embed)
-
-                await interaction.followup.send("成功加入！", ephemeral=True)
-            else:
-                await interaction.followup.send(f"無法加入：{res.data['message']}", ephemeral=True)
-            pass
-        elif cid.startswith("leave:"):
-            if interaction.user.id == self.host_id:
-                return await interaction.response.send_message("❌ 主揪不能退出，請直接使用「刪除拼車」功能。", ephemeral=True)
-            await interaction.response.defer(ephemeral=True)
-            
-            # 呼叫 RPC 退出
-            res = supabase.rpc('leave_ride', {'ride_uuid': self.ride_id, 'member_id': str(interaction.user.id)}).execute()
-
-            if res.data['success']:
-                ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
-                
-                # 從討論串移除並通知
-                thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
-                await thread.remove_user(interaction.user)
-                await thread.send(f"👋 **{interaction.user.display_name}** 已退出拼車，目前剩餘 {ride['max_passengers'] - ride['current_passengers']} 個空位！")
-
-                # 恢復原訊息的「可加入」狀態與按鈕
-                embed = interaction.message.embeds[0]
-                embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
-                
-                # 重新把 View 加回去 (如果之前因為滿員被移除了)
-                await interaction.message.edit(content=f"{interaction.guild.get_member(self.host_id).mention} 發起了拼車！", embed=embed, view=self)
-
-                await interaction.followup.send("已成功退出拼車。", ephemeral=True)
-            else:
-                await interaction.followup.send(f"失敗：{res.data['message']}", ephemeral=True)
-
-            # (這是在 RideActionView 的 leave_btn 邏輯中)
-            now = datetime.now(tz_tw)
-            ride_dt = datetime.strptime(f"{ride['ride_date']} {ride['ride_time']}", "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
-
-            # 如果還沒到提醒時間 (剩餘時間 > 10 分鐘)
-            if ride_dt > now + timedelta(minutes=10):
-                # 1. 狀態改回 active，reminder_sent 改回 False (確保排程任務未來會再次抓到它)
-                supabase.table("rides").update({
-                    "status": "active",
-                    "reminder_sent": False
-                }).eq("id", self.ride_id).execute()
-                
-                # 2. 修改原訊息，把按鈕 (self) 重新塞進去
-                msg = await interaction.channel.fetch_message(int(ride['message_id']))
-                await msg.edit(content=f"{interaction.guild.get_member(self.host_id).mention} 發起了拼車！", view=self)
-            pass
+            # 2. 執行加入邏輯
+            await self.handle_join(interaction)
         return True
-    
 
+    async def handle_join(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        # A. 呼叫 Supabase RPC 加入資料庫
+        # 請確保資料庫有對應的 join_ride 函數
+        res = supabase.rpc('join_ride', {
+            'ride_uuid': self.ride_id, 
+            'member_id': str(interaction.user.id)
+        }).execute()
+
+        if not res.data['success']:
+            return await interaction.followup.send(f"❌ 無法加入：{res.data['message']}", ephemeral=True)
+
+        # B. 加入成功，取得最新車次資料
+        ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
+        
+        # C. 處理私密討論串：拉人進去並發送「退出按鈕」
+        try:
+            thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
+            if thread:
+                await thread.add_user(interaction.user)
+                
+                # --- 關鍵：在這裡發送帶有退出按鈕的 View ---
+                # 我們把 ThreadActionView 定義在下面
+                view = ThreadActionView(ride_id=self.ride_id) 
+                await thread.send(
+                    f"🎊 歡迎 {interaction.user.mention} 加入拼車！\n"
+                    f"目前人數：**{ride['current_passengers']}/{ride['max_passengers']}**\n"
+                    "若需退出，請點擊下方按鈕：",
+                    view=view
+                )
+        except Exception as e:
+            print(f"討論串操作失敗: {e}")
+
+        # D. 更新主頻道的公告 Embed
+        embed = interaction.message.embeds[0]
+        embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
+        
+        # E. 檢查是否滿人，滿員則關閉按鈕
+        if ride['current_passengers'] >= ride['max_passengers']:
+            await interaction.message.edit(content="🔒 **本車已滿員**", embed=embed, view=None)
+            supabase.table("rides").update({"status": "inactive"}).eq("id", self.ride_id).execute()
+        else:
+            await interaction.message.edit(embed=embed)
+
+        await interaction.followup.send("✅ 成功加入！請前往討論串查看細節。", ephemeral=True)
+
+class ThreadActionView(discord.ui.View):
+    def __init__(self, ride_id: str):
+        super().__init__(timeout=None)
+        self.ride_id = ride_id
+        
+        self.add_item(discord.ui.Button(
+            label="退出拼車", 
+            style=discord.ButtonStyle.danger, 
+            custom_id=f"leave_thread:{ride_id}"
+        ))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        cid = interaction.data.get('custom_id', '')
+        if cid.startswith("leave_thread:"):
+            await self.handle_leave(interaction)
+        return True
+
+    async def handle_leave(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        # 呼叫 RPC 執行退出邏輯
+        res = supabase.rpc('leave_ride', {
+            'ride_uuid': self.ride_id, 
+            'member_id': str(interaction.user.id)
+        }).execute()
+
+        if not res.data['success']:
+            return await interaction.followup.send(f"❌ 退出失敗：{res.data['message']}", ephemeral=True)
+
+        # 退出成功，抓取資料更新主頻道 UI
+        ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
+        
+        # 1. 更新主頻道公告訊息
+        try:
+            channel = interaction.guild.get_channel(int(ride['channel_id']))
+            msg = await channel.fetch_message(int(ride['message_id']))
+            embed = msg.embeds[0]
+            embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
+            
+            # 如果之前是滿員關閉狀態，現在有位子了，就把加入按鈕塞回去
+            new_view = RideActionView(ride_id=self.ride_id, host_id=int(ride['host_id']))
+            await msg.edit(content=f"<@{ride['host_id']}> 發起了拼車！", embed=embed, view=new_view)
+            
+            # 確保資料庫狀態改回 active
+            supabase.table("rides").update({"status": "active"}).eq("id", self.ride_id).execute()
+        except:
+            pass
+
+        # 2. 在討論串通知並移除該成員
+        await interaction.channel.send(f"👋 {interaction.user.mention} 已退出拼車。")
+        await interaction.followup.send("已成功退出拼車。", ephemeral=True)
+        
+        # 延遲一點點時間後移除成員
+        await asyncio.sleep(2)
+        await interaction.channel.remove_user(interaction.user)
+    
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
