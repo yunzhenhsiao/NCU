@@ -26,6 +26,95 @@ tz_tw = timezone(timedelta(hours=8))
 
 # 定義 Bot
 class Client(commands.Bot):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    # 定時任務：每 10 分鐘檢查一次，看看有哪些車即將發車（10 分鐘內），然後發送提醒並關閉按鈕
+    @tasks.loop(minutes=10)
+    async def check_rides_and_remind(self):
+        now = datetime.now(tz_tw)
+        # 提醒閾值：現在時間 + 10 分鐘
+        threshold = now + timedelta(minutes=10)
+
+        # 1. 撈出符合條件的車：active、尚未發過提醒
+        # 我們不限定「剛好」10分鐘，而是「小於等於 10 分鐘」的所有歷史未發送車次
+        response = supabase.table("rides")\
+            .select("*")\
+            .eq("status", "active")\
+            .eq("reminder_sent", False)\
+            .execute()
+
+        for ride in response.data:
+            # 合併日期時間並掛上台北時區
+            ride_dt_str = f"{ride['ride_date']} {ride['ride_time']}"
+            ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
+
+            if ride_dt <= threshold:
+                # --- 執行提醒與關閉邏輯 ---
+                
+                # A. 更新資料庫狀態（先更新資料庫，防止程式當掉重複發送）
+                supabase.table("rides").update({
+                    "status": "inactive",
+                    "reminder_sent": True
+                }).eq("id", ride['id']).execute()
+
+                # B. 關閉原訊息的按鈕
+                try:
+                    channel = self.get_channel(int(ride['channel_id']))
+                    if channel:
+                        msg = await channel.fetch_message(int(ride['message_id']))
+                        # 修改 Embed 顏色或內容，並移除 view (按鈕)
+                        embed = msg.embeds[0]
+                        embed.color = discord.Color.red()
+                        embed.title = "🔒 拼車招募已結束"
+                        await msg.edit(content="🔔 **本車已發車或停止招募**", embed=embed, view=None)
+                except Exception as e:
+                    print(f"修改訊息失敗 (可能訊息已被刪除): {e}")
+
+                # C. 發送提醒到私人討論串
+                try:
+                    thread = await self.fetch_channel(int(ride['thread_id']))
+                    if thread:
+                        await thread.send(f"⚠️ **發車提醒**：各位乘客好，本車將於 10 分鐘內發車！請準備前往集合地點。")
+                        await thread.send("*(本討論串已自動關閉加入功能)*")
+                except Exception as e:
+                    print(f"討論串發送提醒失敗: {e}")
+                
+                # 避免連續修改訊息太快，小睡一下
+                await asyncio.sleep(1)
+
+    # 定時任務：每週檢查一次，看看有哪些車已經過期（發車時間在現在之前），然後標記為刪除並關閉討論串
+    @tasks.loop(hours=168) # 168 小時 = 7 天
+    async def weekly_cleanup(self):
+        now = datetime.now(tz_tw)
+        
+        # 撈出所有已經發車（過去時間）且尚未歸檔的車
+        # 為了簡單起見，這裡先撈出 status 為 inactive 且 is_deleted 為 False 的
+        response = supabase.table("rides")\
+            .select("*")\
+            .eq("is_deleted", False)\
+            .execute()
+
+        for ride in response.data:
+            ride_dt_str = f"{ride['ride_date']} {ride['ride_time']}"
+            ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
+
+            if ride_dt < now:
+                # 執行歸檔：標記 is_deleted
+                supabase.table("rides").update({"is_deleted": True}).eq("id", ride['id']).execute()
+                
+                # 關閉/歸檔討論串 (避免討論串列表太亂)
+                try:
+                    thread = await self.fetch_channel(int(ride['thread_id']))
+                    if thread:
+                        await thread.edit(archived=True, locked=True)
+                except Exception as e:
+                    print(f"歸檔討論串失敗: {e}")
+
+                # 遵守你的 Rate Limit 建議，處理大量資料時每筆休息 1 秒
+                await asyncio.sleep(1)
+                
     async def on_ready(self):
         print(f'Logged in as {self.user}')
 
@@ -170,106 +259,101 @@ class CarpoolView(discord.ui.View):
 # 這個 View 是在使用者成功建立拼車後，附加在公告訊息上的按鈕
 class RideActionView(discord.ui.View):
     def __init__(self, ride_id: str, host_id: int):
-        # 這裡的 timeout=None 是持久化 View 的必要條件
         super().__init__(timeout=None)
         self.ride_id = ride_id
         self.host_id = host_id
-
-        # 這裡手動設定每個按鈕的 custom_id，包含 ride_id
-        # 這能讓機器人重啟後，點擊按鈕時正確對應到資料庫的 ride_id
-        self.join_btn_obj = discord.ui.Button(
+        
+        # 使用固定的 custom_id，機器人重啟後才能透過這個 ID 認出它
+        self.add_item(discord.ui.Button(
             label="加入拼車", 
             style=discord.ButtonStyle.success, 
             custom_id=f"join:{ride_id}"
-        )
-        self.join_btn_obj.callback = self.join_callback
-        
-        self.leave_btn_obj = discord.ui.Button(
+        ))
+        self.add_item(discord.ui.Button(
             label="退出拼車", 
             style=discord.ButtonStyle.danger, 
             custom_id=f"leave:{ride_id}"
-        )
-        self.leave_btn_obj.callback = self.leave_callback
+        ))
 
-        self.add_item(self.join_btn_obj)
-        self.add_item(self.leave_btn_obj)
-
-    async def join_callback(self, interaction: discord.Interaction):
-        # 這裡放入你原本寫在 join_btn 裝飾器內的邏輯
-        if interaction.user.id == self.host_id:
-            return await interaction.response.send_message("❌ 你是主揪，不能重複加入自己的車！", ephemeral=True)
-        
-        await interaction.response.defer(ephemeral=True)
-        # 使用 self.ride_id 進行 RPC 呼叫
-        res = supabase.rpc('join_ride', {'ride_uuid': self.ride_id, 'member_id': str(interaction.user.id)}).execute()
-        if res.data['success']:
-            # 取得最新資料來更新 UI
-            ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
+    # 針對動態 custom_id 的處理方式
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        cid = interaction.data.get('custom_id', '')
+        if cid.startswith("join:"):
+            if interaction.user.id == self.host_id:
+                return await interaction.response.send_message("❌ 你是主揪，不能重複加入自己的車！", ephemeral=True)
             
-            # 通知討論串
-            thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
-            await thread.add_user(interaction.user)
-            await thread.send(f"✅ **{interaction.user.display_name}** 已加入拼車！目前人數：{ride['current_passengers']}/{ride['max_passengers']}")
+            await interaction.response.defer(ephemeral=True)
+            # 使用 self.ride_id 進行 RPC 呼叫
+            res = supabase.rpc('join_ride', {'ride_uuid': self.ride_id, 'member_id': str(interaction.user.id)}).execute()
+            if res.data['success']:
+                # 取得最新資料來更新 UI
+                ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
+                
+                # 通知討論串
+                thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
+                await thread.add_user(interaction.user)
+                await thread.send(f"✅ **{interaction.user.display_name}** 已加入拼車！目前人數：{ride['current_passengers']}/{ride['max_passengers']}")
 
-            # 更新原訊息 Embed
-            embed = interaction.message.embeds[0]
-            embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
-            
-            # 檢查是否滿人需要關閉按鈕
-            if ride['current_passengers'] >= ride['max_passengers']:
-                await interaction.message.edit(content="🔒 **本車已滿員**", embed=embed, view=None)
-                supabase.table("rides").update({"status": "inactive"}).eq("id", self.ride_id).execute()
+                # 更新原訊息 Embed
+                embed = interaction.message.embeds[0]
+                embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
+                
+                # 檢查是否滿人需要關閉按鈕
+                if ride['current_passengers'] >= ride['max_passengers']:
+                    await interaction.message.edit(content="🔒 **本車已滿員**", embed=embed, view=None)
+                    supabase.table("rides").update({"status": "inactive"}).eq("id", self.ride_id).execute()
+                else:
+                    await interaction.message.edit(embed=embed)
+
+                await interaction.followup.send("成功加入！", ephemeral=True)
             else:
-                await interaction.message.edit(embed=embed)
-
-            await interaction.followup.send("成功加入！", ephemeral=True)
-        else:
-            await interaction.followup.send(f"無法加入：{res.data['message']}", ephemeral=True)
-
-    async def leave_callback(self, interaction: discord.Interaction):
-        # 這裡放入原本 leave_btn 的邏輯
-        if interaction.user.id == self.host_id:
-            return await interaction.response.send_message("❌ 主揪不能退出，請直接使用「刪除拼車」功能。", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        
-        # 呼叫 RPC 退出
-        res = supabase.rpc('leave_ride', {'ride_uuid': self.ride_id, 'member_id': str(interaction.user.id)}).execute()
-
-        if res.data['success']:
-            ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
+                await interaction.followup.send(f"無法加入：{res.data['message']}", ephemeral=True)
+            pass
+        elif cid.startswith("leave:"):
+            if interaction.user.id == self.host_id:
+                return await interaction.response.send_message("❌ 主揪不能退出，請直接使用「刪除拼車」功能。", ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
             
-            # 從討論串移除並通知
-            thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
-            await thread.remove_user(interaction.user)
-            await thread.send(f"👋 **{interaction.user.display_name}** 已退出拼車，目前剩餘 {ride['max_passengers'] - ride['current_passengers']} 個空位！")
+            # 呼叫 RPC 退出
+            res = supabase.rpc('leave_ride', {'ride_uuid': self.ride_id, 'member_id': str(interaction.user.id)}).execute()
 
-            # 恢復原訊息的「可加入」狀態與按鈕
-            embed = interaction.message.embeds[0]
-            embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
-            
-            # 重新把 View 加回去 (如果之前因為滿員被移除了)
-            await interaction.message.edit(content=f"{interaction.guild.get_member(self.host_id).mention} 發起了拼車！", embed=embed, view=self)
+            if res.data['success']:
+                ride = supabase.table("rides").select("*").eq("id", self.ride_id).single().execute().data
+                
+                # 從討論串移除並通知
+                thread = await interaction.guild.fetch_channel(int(ride['thread_id']))
+                await thread.remove_user(interaction.user)
+                await thread.send(f"👋 **{interaction.user.display_name}** 已退出拼車，目前剩餘 {ride['max_passengers'] - ride['current_passengers']} 個空位！")
 
-            await interaction.followup.send("已成功退出拼車。", ephemeral=True)
-        else:
-            await interaction.followup.send(f"失敗：{res.data['message']}", ephemeral=True)
+                # 恢復原訊息的「可加入」狀態與按鈕
+                embed = interaction.message.embeds[0]
+                embed.set_field_at(2, name="👥 人數", value=f"{ride['current_passengers']} / {ride['max_passengers']}", inline=True)
+                
+                # 重新把 View 加回去 (如果之前因為滿員被移除了)
+                await interaction.message.edit(content=f"{interaction.guild.get_member(self.host_id).mention} 發起了拼車！", embed=embed, view=self)
 
-        # (這是在 RideActionView 的 leave_btn 邏輯中)
-        now = datetime.now(tz_tw)
-        ride_dt = datetime.strptime(f"{ride['ride_date']} {ride['ride_time']}", "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
+                await interaction.followup.send("已成功退出拼車。", ephemeral=True)
+            else:
+                await interaction.followup.send(f"失敗：{res.data['message']}", ephemeral=True)
 
-        # 如果還沒到提醒時間 (剩餘時間 > 10 分鐘)
-        if ride_dt > now + timedelta(minutes=10):
-            # 1. 狀態改回 active，reminder_sent 改回 False (確保排程任務未來會再次抓到它)
-            supabase.table("rides").update({
-                "status": "active",
-                "reminder_sent": False
-            }).eq("id", self.ride_id).execute()
-            
-            # 2. 修改原訊息，把按鈕 (self) 重新塞進去
-            msg = await interaction.channel.fetch_message(int(ride['message_id']))
-            await msg.edit(content=f"{interaction.guild.get_member(self.host_id).mention} 發起了拼車！", view=self)
+            # (這是在 RideActionView 的 leave_btn 邏輯中)
+            now = datetime.now(tz_tw)
+            ride_dt = datetime.strptime(f"{ride['ride_date']} {ride['ride_time']}", "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
 
+            # 如果還沒到提醒時間 (剩餘時間 > 10 分鐘)
+            if ride_dt > now + timedelta(minutes=10):
+                # 1. 狀態改回 active，reminder_sent 改回 False (確保排程任務未來會再次抓到它)
+                supabase.table("rides").update({
+                    "status": "active",
+                    "reminder_sent": False
+                }).eq("id", self.ride_id).execute()
+                
+                # 2. 修改原訊息，把按鈕 (self) 重新塞進去
+                msg = await interaction.channel.fetch_message(int(ride['message_id']))
+                await msg.edit(content=f"{interaction.guild.get_member(self.host_id).mention} 發起了拼車！", view=self)
+            pass
+        return True
+    
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -522,91 +606,6 @@ class MyRideManagementView(discord.ui.View):
 async def purge(interaction: discord.Interaction, limit: int = 100):
     deleted = await interaction.channel.purge(limit=limit)
     await interaction.followup.send(f"✅ 清理完成！已刪除 {len(deleted)} 則訊息。", ephemeral=True)
-
-# 定時任務：每 10 分鐘檢查一次，看看有哪些車即將發車（10 分鐘內），然後發送提醒並關閉按鈕
-@tasks.loop(minutes=10)
-async def check_rides_and_remind(self):
-    now = datetime.now(tz_tw)
-    # 提醒閾值：現在時間 + 10 分鐘
-    threshold = now + timedelta(minutes=10)
-
-    # 1. 撈出符合條件的車：active、尚未發過提醒
-    # 我們不限定「剛好」10分鐘，而是「小於等於 10 分鐘」的所有歷史未發送車次
-    response = supabase.table("rides")\
-        .select("*")\
-        .eq("status", "active")\
-        .eq("reminder_sent", False)\
-        .execute()
-
-    for ride in response.data:
-        # 合併日期時間並掛上台北時區
-        ride_dt_str = f"{ride['ride_date']} {ride['ride_time']}"
-        ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
-
-        if ride_dt <= threshold:
-            # --- 執行提醒與關閉邏輯 ---
-            
-            # A. 更新資料庫狀態（先更新資料庫，防止程式當掉重複發送）
-            supabase.table("rides").update({
-                "status": "inactive",
-                "reminder_sent": True
-            }).eq("id", ride['id']).execute()
-
-            # B. 關閉原訊息的按鈕
-            try:
-                channel = self.get_channel(int(ride['channel_id']))
-                if channel:
-                    msg = await channel.fetch_message(int(ride['message_id']))
-                    # 修改 Embed 顏色或內容，並移除 view (按鈕)
-                    embed = msg.embeds[0]
-                    embed.color = discord.Color.red()
-                    embed.title = "🔒 拼車招募已結束"
-                    await msg.edit(content="🔔 **本車已發車或停止招募**", embed=embed, view=None)
-            except Exception as e:
-                print(f"修改訊息失敗 (可能訊息已被刪除): {e}")
-
-            # C. 發送提醒到私人討論串
-            try:
-                thread = await self.fetch_channel(int(ride['thread_id']))
-                if thread:
-                    await thread.send(f"⚠️ **發車提醒**：各位乘客好，本車將於 10 分鐘內發車！請準備前往集合地點。")
-                    await thread.send("*(本討論串已自動關閉加入功能)*")
-            except Exception as e:
-                print(f"討論串發送提醒失敗: {e}")
-            
-            # 避免連續修改訊息太快，小睡一下
-            await asyncio.sleep(1)
-
-# 定時任務：每週檢查一次，看看有哪些車已經過期（發車時間在現在之前），然後標記為刪除並關閉討論串
-@tasks.loop(hours=168) # 168 小時 = 7 天
-async def weekly_cleanup(self):
-    now = datetime.now(tz_tw)
-    
-    # 撈出所有已經發車（過去時間）且尚未歸檔的車
-    # 為了簡單起見，這裡先撈出 status 為 inactive 且 is_deleted 為 False 的
-    response = supabase.table("rides")\
-        .select("*")\
-        .eq("is_deleted", False)\
-        .execute()
-
-    for ride in response.data:
-        ride_dt_str = f"{ride['ride_date']} {ride['ride_time']}"
-        ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
-
-        if ride_dt < now:
-            # 執行歸檔：標記 is_deleted
-            supabase.table("rides").update({"is_deleted": True}).eq("id", ride['id']).execute()
-            
-            # 關閉/歸檔討論串 (避免討論串列表太亂)
-            try:
-                thread = await self.fetch_channel(int(ride['thread_id']))
-                if thread:
-                    await thread.edit(archived=True, locked=True)
-            except Exception as e:
-                print(f"歸檔討論串失敗: {e}")
-
-            # 遵守你的 Rate Limit 建議，處理大量資料時每筆休息 1 秒
-            await asyncio.sleep(1)
 
 if __name__ == "__main__":
     keep_alive()
