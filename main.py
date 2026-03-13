@@ -48,7 +48,12 @@ class Client(commands.Bot):
         for ride in response.data:
             # 合併日期時間並掛上台北時區
             ride_dt_str = f"{ride['ride_date']} {ride['ride_time']}"
-            ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
+            try:
+                # 嘗試包含秒數的格式
+                ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz_tw)
+            except ValueError:
+                # 如果資料剛好沒秒數，則用原本的格式
+                ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
 
             if ride_dt <= threshold:
                 # --- 執行提醒與關閉邏輯 ---
@@ -98,7 +103,10 @@ class Client(commands.Bot):
 
         for ride in response.data:
             ride_dt_str = f"{ride['ride_date']} {ride['ride_time']}"
-            ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
+            try:
+                ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz_tw)
+            except ValueError:
+                ride_dt = datetime.strptime(ride_dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz_tw)
 
             if ride_dt < now:
                 # 執行歸檔：標記 is_deleted
