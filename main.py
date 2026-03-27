@@ -3,6 +3,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -24,41 +27,69 @@ class SearchCriteria(BaseModel):
 async def search_courses(criteria: SearchCriteria):
     print(f"--- 收到請求 ---")
     print(f"原始資料: {criteria}")
+
+    intToStr = {
+        1: "一",
+        2: "二",
+        3: "三",
+        4: "四",
+        5: "五",
+        6: "六",
+        7: "日"
+    }
     
     try:
-        # 1. 基本查詢 (先選出所有欄位)
-        query = supabase.table("course_schedule").select("*")
+        # 1. 使用 inner join 串接 course_schedule 與 course_catalog
+        # 我們從 course_schedule 開始查，並強制要求必須有對應的 catalog 資料
+        query = supabase.table("course_schedule").select(
+            "*, course_catalog!inner(*)"
+        )
 
-        # 2. 動態過濾 (請確保欄位名稱與 Supabase 一致)
-        if criteria.day:
-            # 強制轉為 int 確保跟資料庫型別一致
-            query = query.eq("day", int(criteria.day))
+        # 2. 動態過濾 - 注意欄位名稱需與你的 SQL 一致
         
-        if criteria.course_type:
-            query = query.eq("type", criteria.course_type)
+        # 過濾星期 (SQL 裡 day 是 text)
+        if criteria.day:
+            query = query.eq("day", intToStr.get(criteria.day, str(criteria.day)))
+        
+        # 過濾節次 (SQL 裡 time 是 text，我們用 in_ 來比對多個節次)
+        if criteria.slots:
+            # 將 [5, 6] 轉為 ["5", "6"] 以符合 SQL 的 text 型別
+            str_slots = [str(s) for s in criteria.slots]
+            query = query.in_("time", str_slots)
             
+        # 過濾課程類別 (對應 course_catalog 裡的 category)
+        if criteria.course_type:
+            query = query.eq("course_catalog.required_type", criteria.course_type)
+            
+        # 過濾系所 (對應 course_catalog 裡的 dept_code)
         if criteria.dept:
-            # 假設資管系也要看特定系所欄位
-            query = query.eq("department", criteria.dept)
+            query = query.eq("course_catalog.dept_code", criteria.dept)
 
         # 3. 執行查詢
         response = query.execute()
-        all_data = response.data
-        
-        # 4. 處理 slots 過濾 (假設 slots 在 DB 是 [1, 2, 3] 陣列)
-        filtered_data = all_data
-        if criteria.slots and all_data:
-            # 找出「只要重疊到任何一節」的課
-            filtered_data = [
-                course for course in all_data 
-                if any(s in (course.get("slots") or []) for s in criteria.slots)
-            ]
+        raw_data = response.data
 
-        print(f"查詢成功，找到 {len(filtered_data)} 筆資料")
-        return {"status": "success", "data": filtered_data}
+        # 4. 資料整理 (將巢狀的 catalog 資訊拉出來，方便 Dify 閱讀)
+        formatted_data = []
+        for item in raw_data:
+            catalog = item.get("course_catalog", {})
+            formatted_data.append({
+                "course_id": item.get("course_id"),
+                "title": catalog.get("title_zh"),
+                "teacher": catalog.get("teacher"),
+                "day": item.get("day"),
+                "time": item.get("time"),
+                "classroom": item.get("classroom"),
+                "category": catalog.get("required_type"),
+                "dept": catalog.get("dept_code"),
+                "credit": catalog.get("credit")
+                # day time classroom 以後在同一個變數回傳
+            })
+
+        print(f"查詢成功，找到 {len(formatted_data)} 筆節次資料")
+        return {"status": "success", "data": formatted_data}
 
     except Exception as e:
-        # 這裡會印出到底是哪一行出錯
         import traceback
         print("!!! 後端出錯了 !!!")
         print(traceback.format_exc()) 
