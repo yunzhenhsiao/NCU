@@ -171,7 +171,13 @@ async def search_courses(criteria: SearchCriteria):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    
+    # 優先讀取雲端環境指定的 PORT (通常平台會注入這個環境變數)，若無則預設為 8000
+    port = int(os.environ.get("PORT", 8000)) 
+    print(f"🚀 正在啟動 FastAPI，監聽 Port: {port}")
+    
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 # 使用方法
 # 先打 python main.py 啟動後端
