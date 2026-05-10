@@ -1,8 +1,8 @@
-## 🎓 NCU 課程查詢系統 - Backend API
+### 🎓 NCU 課程查詢系統 - Backend API
 
 這是 NCU 課程查詢小幫手 的後端服務，負責連接 `Dify` (LLM 平台) 與 `Supabase` (資料庫)。當 `Dify` 接收到使用者的查課意圖後，會呼叫此 `API`，由後端進行精確的資料庫篩選與模糊搜尋，並將優化後的資料回傳給 LLM 進行回覆。
 
-## 🚀 技術棧 (Tech Stack)
+### 🚀 技術棧 (Tech Stack)
 
 核心框架: `FastAPI` - 高效能的 Python Web 框架。
 
@@ -12,7 +12,7 @@
 
 資料操作: `Supabase Python SDK`, `Pydantic` (資料驗證)。
 
-## 🌟 核心功能
+### 🌟 核心功能
 
 智慧路由搜尋:
 
@@ -32,7 +32,7 @@
   
     支援動態 Port 讀取與環境變數配置，完美適應 Render 部署環境。
 
-## 🛠️ API 規格
+### 🛠️ API 規格
 
 搜尋課程 (Search Courses):
 
@@ -70,7 +70,7 @@
       ]
     }
     
-## ⚙️ 本地開發環境設定
+### ⚙️ 本地開發環境設定
 
 
 1.複製專案:
@@ -94,7 +94,7 @@
 
   `python main.py`
 
-## 🌐 部署說明 (Render)
+### 🌐 部署說明 (Render)
 
 1.將程式碼推送到 GitHub。
 
